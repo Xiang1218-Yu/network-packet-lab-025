@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import type {
   HexRow,
+  PacketOrigin,
   PacketScenario,
   ParseRequest,
   Protocol,
@@ -133,11 +134,52 @@ function checksum(raw: string): string {
   return `0x${hash.toString(16).padStart(4, '0').toUpperCase()}`;
 }
 
-function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string): SimulatedPacket {
-  const safeRaw = raw.trim() ? raw : (protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario]);
+/** 已生成帧的内存注册表，用于校验派生关系与血缘查询（容量有限，先进先出）。 */
+const frameStore = new Map<string, SimulatedPacket>();
+const FRAME_STORE_LIMIT = 500;
+let frameSequence = 0;
+
+function sampleRawFor(protocol: Protocol, scenario: PacketScenario): string {
+  return protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario];
+}
+
+function sampleIdFor(protocol: Protocol, scenario: PacketScenario): string {
+  return `${protocol.toLowerCase()}-${scenario}`;
+}
+
+/**
+ * 判定帧来源：
+ * 1. raw 与当前场景的内置样例完全一致 → sample（未修改的重新解析不会变成派生帧）；
+ * 2. 提供了 parentId 且父帧确实存在、raw 相对父帧有实际变化 → derived；
+ * 3. 其余情况（含父帧未知、raw 与父帧相同）→ user-input，不制造虚假的父子关系。
+ */
+function resolveOrigin(protocol: Protocol, scenario: PacketScenario, raw: string, parentId?: string): PacketOrigin {
+  const recordedAt = new Date().toISOString();
+  if (raw === sampleRawFor(protocol, scenario)) {
+    return { kind: 'sample', sampleId: sampleIdFor(protocol, scenario), recordedAt };
+  }
+  if (parentId) {
+    const parent = frameStore.get(parentId);
+    if (parent && parent.raw !== raw) {
+      return { kind: 'derived', parentId, recordedAt };
+    }
+  }
+  return { kind: 'user-input', recordedAt };
+}
+
+function rememberFrame(packet: SimulatedPacket): void {
+  if (frameStore.size >= FRAME_STORE_LIMIT) {
+    const oldest = frameStore.keys().next();
+    if (!oldest.done) frameStore.delete(oldest.value);
+  }
+  frameStore.set(packet.id, packet);
+}
+
+function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string, parentId?: string): SimulatedPacket {
+  const safeRaw = raw.trim() ? raw : sampleRawFor(protocol, scenario);
   const isHttp = protocol === 'HTTP';
-  return {
-    id: `${protocol.toLowerCase()}-${scenario}-${Date.now().toString(36).slice(-6)}`,
+  const packet: SimulatedPacket = {
+    id: `${protocol.toLowerCase()}-${scenario}-${Date.now().toString(36)}${(frameSequence++).toString(36)}`,
     protocol,
     scenario,
     summary: isHttp
@@ -153,8 +195,11 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
       destination: isHttp ? '10.0.0.8:443' : (safeRaw.split(' > ')[1]?.split(' | ')[0] ?? '10.0.0.8:443'),
       length: Buffer.byteLength(safeRaw, 'utf8'),
       checksum: checksum(safeRaw)
-    }
+    },
+    origin: resolveOrigin(protocol, scenario, safeRaw, parentId)
   };
+  rememberFrame(packet);
+  return packet;
 }
 
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
@@ -178,8 +223,15 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const protocol = isProtocol(request.body?.protocol) ? request.body.protocol : 'HTTP';
   const scenario = isScenario(request.body?.scenario) ? request.body.scenario : 'request';
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
+  const parentId = typeof request.body?.parentId === 'string' ? request.body.parentId : undefined;
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
-  response.json({ data: buildPacket(protocol, scenario, raw) });
+  response.json({ data: buildPacket(protocol, scenario, raw, parentId) });
+});
+
+app.get('/api/frames/:id', (request, response) => {
+  const packet = frameStore.get(request.params.id);
+  if (!packet) return response.status(404).json({ error: 'frame not found' });
+  response.json({ data: packet });
 });
 
 app.listen(port, () => {
