@@ -1,6 +1,12 @@
+import { createHash, randomUUID } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import type {
+  DeletePacketResponse,
   HexRow,
+  ImportRequest,
+  LineageNode,
+  PacketLineage,
+  PacketResponse,
   PacketScenario,
   ParseRequest,
   Protocol,
@@ -16,7 +22,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use((request, response, next) => {
   response.header('Access-Control-Allow-Origin', '*');
   response.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  response.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  response.header('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
   if (request.method === 'OPTIONS') return response.sendStatus(204);
   next();
 });
@@ -32,6 +38,20 @@ const TCP_SAMPLES: Record<PacketScenario, string> = {
   response: 'TCP 10.0.0.8:443 > 10.0.0.24:51842 | Seq=77120102 Ack=18492159 | Flags=ACK,PSH | Win=28960 | Len=512',
   handshake: 'TCP 10.0.0.24:51842 > 10.0.0.8:443 | Seq=0 Ack=0 | Flags=SYN | Win=64240 | MSS=1460 | WS=7'
 };
+
+/**
+ * Every frame the server hands out is registered here, keyed by id, so that
+ * derived frames can resolve their parents and deletions can break those
+ * links. Samples use deterministic ids and are re-registered on each fetch.
+ */
+const store = new Map<string, SimulatedPacket>();
+
+/** Lineage as persisted on a stored packet; parentMissing/chain are resolved at read time. */
+type StoredLineage = Omit<PacketLineage, 'parentMissing' | 'chain'>;
+
+function contentHash(raw: string): string {
+  return createHash('sha256').update(raw, 'utf8').digest('hex').slice(0, 16);
+}
 
 function hexDump(value: string): HexRow[] {
   const bytes = Array.from(Buffer.from(value, 'utf8'));
@@ -133,11 +153,17 @@ function checksum(raw: string): string {
   return `0x${hash.toString(16).padStart(4, '0').toUpperCase()}`;
 }
 
-function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string): SimulatedPacket {
+function buildPacket(
+  protocol: Protocol,
+  scenario: PacketScenario,
+  raw: string,
+  origin: Omit<StoredLineage, 'contentHash'>,
+  id = `pkt-${randomUUID().slice(0, 8)}`
+): SimulatedPacket {
   const safeRaw = raw.trim() ? raw : (protocol === 'HTTP' ? HTTP_SAMPLES[scenario] : TCP_SAMPLES[scenario]);
   const isHttp = protocol === 'HTTP';
   return {
-    id: `${protocol.toLowerCase()}-${scenario}-${Date.now().toString(36).slice(-6)}`,
+    id,
     protocol,
     scenario,
     summary: isHttp
@@ -153,8 +179,94 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
       destination: isHttp ? '10.0.0.8:443' : (safeRaw.split(' > ')[1]?.split(' | ')[0] ?? '10.0.0.8:443'),
       length: Buffer.byteLength(safeRaw, 'utf8'),
       checksum: checksum(safeRaw)
+    },
+    lineage: { ...origin, contentHash: contentHash(safeRaw) }
+  };
+}
+
+function lineageNodeFor(packet: SimulatedPacket): LineageNode {
+  const lineage = packet.lineage;
+  return {
+    id: packet.id,
+    kind: lineage?.kind ?? 'unknown',
+    ...(lineage?.sampleId ? { sampleId: lineage.sampleId } : {}),
+    ...(lineage?.importedFrom ? { importedFrom: lineage.importedFrom } : {}),
+    ...(lineage?.derivation ? { derivation: lineage.derivation } : {})
+  };
+}
+
+/**
+ * Re-resolves the volatile parts of a packet's lineage (broken parent links,
+ * ancestor chain) against the current store. Must be used for every response
+ * so deletions are reflected immediately.
+ */
+function serializePacket(packet: SimulatedPacket): SimulatedPacket {
+  const lineage = packet.lineage;
+  if (!lineage) return packet;
+  const ancestors: SimulatedPacket[] = [];
+  const visited = new Set<string>([packet.id]);
+  let cursor = packet;
+  let brokenAt: string | null = null;
+  while (cursor.lineage?.parentId) {
+    const parentId = cursor.lineage.parentId;
+    if (visited.has(parentId)) break;
+    const parent = store.get(parentId);
+    if (!parent) {
+      brokenAt = parentId;
+      break;
+    }
+    visited.add(parentId);
+    ancestors.push(parent);
+    cursor = parent;
+  }
+  const chain: LineageNode[] = [];
+  if (brokenAt) chain.push({ id: brokenAt, kind: 'unknown', missing: true });
+  for (const ancestor of ancestors.reverse()) chain.push(lineageNodeFor(ancestor));
+  chain.push(lineageNodeFor(packet));
+  return {
+    ...packet,
+    lineage: {
+      ...lineage,
+      parentMissing: Boolean(lineage.parentId && !store.has(lineage.parentId)),
+      chain
     }
   };
+}
+
+/** True when the packet's ancestor chain passes through the given frame id. */
+function referencesAncestor(packet: SimulatedPacket, id: string): boolean {
+  const visited = new Set<string>();
+  let cursor = packet;
+  while (cursor.lineage?.parentId) {
+    const parentId = cursor.lineage.parentId;
+    if (parentId === id) return true;
+    if (visited.has(parentId)) return false;
+    visited.add(parentId);
+    const parent = store.get(parentId);
+    if (!parent) return false;
+    cursor = parent;
+  }
+  return false;
+}
+
+/** Masks addresses and trace identifiers to produce a sanitized copy of a frame. */
+function sanitizeRaw(raw: string): string {
+  return raw
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, (ip) => ip.split('.').map(() => 'x').join('.'))
+    .replace(/\b(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}\b/g, 'xx:xx:xx:xx:xx:xx')
+    .replace(/(X-Trace-Id\s*:\s*).*/gim, '$1<redacted>');
+}
+
+function registerSample(protocol: Protocol, scenario: PacketScenario): SimulatedPacket {
+  const packet = buildPacket(
+    protocol,
+    scenario,
+    '',
+    { kind: 'sample', sampleId: `${protocol}/${scenario}` },
+    `sample-${protocol.toLowerCase()}-${scenario}`
+  );
+  store.set(packet.id, packet);
+  return packet;
 }
 
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
@@ -165,13 +277,19 @@ app.get('/api/health', (_request, response) => response.json({ ok: true, service
 app.get('/api/simulate', (request, response) => {
   const protocol = isProtocol(request.query.protocol) ? request.query.protocol : 'HTTP';
   const scenario = isScenario(request.query.scenario) ? request.query.scenario : (protocol === 'HTTP' ? 'request' : 'handshake');
-  response.json({ data: buildPacket(protocol, scenario, '') });
+  response.json({ data: serializePacket(registerSample(protocol, scenario)) });
 });
 
 app.get('/api/packets', (request, response) => {
   const protocol = isProtocol(request.query.protocol) ? request.query.protocol : 'HTTP';
   const scenarios: PacketScenario[] = protocol === 'HTTP' ? ['request', 'response'] : ['handshake', 'request', 'response'];
-  response.json({ data: scenarios.map((scenario) => buildPacket(protocol, scenario, '')) });
+  response.json({ data: scenarios.map((scenario) => serializePacket(registerSample(protocol, scenario))) });
+});
+
+app.get('/api/packets/:id', (request, response) => {
+  const packet = store.get(request.params.id);
+  if (!packet) return response.status(404).json({ error: 'packet not found' });
+  response.json({ data: serializePacket(packet) });
 });
 
 app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>>, response: Response) => {
@@ -179,7 +297,78 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const scenario = isScenario(request.body?.scenario) ? request.body.scenario : 'request';
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
-  response.json({ data: buildPacket(protocol, scenario, raw) });
+  const parentId = typeof request.body?.parentId === 'string' ? request.body.parentId : undefined;
+  const parent = parentId ? store.get(parentId) : undefined;
+  const hash = contentHash(raw);
+  if (parent?.lineage?.contentHash === hash && parent.protocol === protocol && parent.scenario === scenario) {
+    // Identical re-parse of a known frame: hand the existing frame back
+    // instead of fabricating a parent-child relation.
+    const body: PacketResponse = { data: serializePacket(parent), reused: true };
+    return response.json(body);
+  }
+  const origin: Omit<StoredLineage, 'contentHash'> = parent
+    ? { kind: 'derived', parentId: parent.id, derivation: 'edited' }
+    : { kind: 'user-input' };
+  const packet = buildPacket(protocol, scenario, raw, origin);
+  store.set(packet.id, packet);
+  const body: PacketResponse = { data: serializePacket(packet) };
+  response.json(body);
+});
+
+app.post('/api/import', (request: Request<unknown, unknown, Partial<ImportRequest>>, response: Response) => {
+  const protocol = isProtocol(request.body?.protocol) ? request.body.protocol : 'HTTP';
+  const scenario = isScenario(request.body?.scenario) ? request.body.scenario : 'request';
+  const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
+  if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
+  const fileName = typeof request.body?.fileName === 'string' && request.body.fileName.trim()
+    ? request.body.fileName.trim().slice(0, 120)
+    : 'unknown file';
+  const packet = buildPacket(protocol, scenario, raw, { kind: 'import', importedFrom: fileName });
+  store.set(packet.id, packet);
+  response.json({ data: serializePacket(packet) });
+});
+
+app.post('/api/packets/:id/derive', (request, response) => {
+  const parent = store.get(request.params.id);
+  if (!parent) return response.status(404).json({ error: 'parent packet not found' });
+  const raw = sanitizeRaw(parent.raw);
+  const hash = contentHash(raw);
+  if (parent.lineage?.contentHash === hash) {
+    // Nothing left to mask — the parent already is sanitized.
+    const body: PacketResponse = { data: serializePacket(parent), reused: true };
+    return response.json(body);
+  }
+  // Re-deriving identical content must not mint a duplicate child frame.
+  const existing = [...store.values()].find((packet) =>
+    packet.lineage?.kind === 'derived' &&
+    packet.lineage.parentId === parent.id &&
+    packet.lineage.derivation === 'sanitized' &&
+    packet.lineage.contentHash === hash
+  );
+  if (existing) {
+    const body: PacketResponse = { data: serializePacket(existing), reused: true };
+    return response.json(body);
+  }
+  const packet = buildPacket(parent.protocol, parent.scenario, raw, {
+    kind: 'derived',
+    parentId: parent.id,
+    derivation: 'sanitized'
+  });
+  store.set(packet.id, packet);
+  const body: PacketResponse = { data: serializePacket(packet) };
+  response.json(body);
+});
+
+app.delete('/api/packets/:id', (request, response) => {
+  const id = request.params.id;
+  if (!store.delete(id)) return response.status(404).json({ error: 'packet not found' });
+  // Frames whose origin chain ran through the deleted id now have a broken
+  // link; return them re-serialized so clients can refresh immediately.
+  const affected = [...store.values()]
+    .filter((packet) => referencesAncestor(packet, id))
+    .map(serializePacket);
+  const body: DeletePacketResponse = { data: { deleted: id, affected } };
+  response.json(body);
 });
 
 app.listen(port, () => {
